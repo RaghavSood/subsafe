@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -108,42 +109,71 @@ func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresse
 		return ChainConfig{}
 	}()
 
-	m.sendMessage(fmt.Sprintf("🟢 Started monitoring %s (Chain ID: %d)", chainConfig.Name, chainID))
+	const (
+		initialRetryDelay = 1 * time.Second
+		maxRetryDelay     = 60 * time.Second
+		backoffFactor     = 2
+	)
 
-	logs := make(chan types.Log)
-	sub, err := client.SubscribeFilterLogs(m.ctx, ethereum.FilterQuery{
-		Addresses: addresses,
-	}, logs)
-
-	if err != nil {
-		m.sendMessage(fmt.Sprintf("❌ Failed to subscribe to logs on chain %d: %v", chainID, err))
-		return
-	}
-	defer sub.Unsubscribe()
+	retryDelay := initialRetryDelay
+	firstConnect := true
 
 	for {
-		select {
-		case err := <-sub.Err():
-			m.sendMessage(fmt.Sprintf("❌ Lost connection to chain %d: %v", chainID, err))
-			return
-		case vLog := <-logs:
-			event, err := m.safeABI.EventByID(vLog.Topics[0])
-			if err != nil {
-				log.Printf("Error parsing event: %v", err)
-				continue
+		if !firstConnect {
+			time.Sleep(retryDelay)
+			retryDelay *= backoffFactor
+			if retryDelay > maxRetryDelay {
+				retryDelay = maxRetryDelay
 			}
+		}
+		firstConnect = false
 
-			txURL := fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, vLog.TxHash.Hex())
-			walletLabel := addressLabels[vLog.Address]
-			msg := fmt.Sprintf("🔔 New event on %s\n"+
-				"Wallet: %s\n"+
-				"Type: %s\n"+
-				"Address: %s\n"+
-				"Transaction: %s",
-				chainConfig.Name, walletLabel, event.Name, vLog.Address.Hex(), txURL)
-			m.sendMessage(msg)
-		case <-m.ctx.Done():
-			return
+		if err := m.ctx.Err(); err != nil {
+			return // Context cancelled
+		}
+
+		m.sendMessage(fmt.Sprintf("🔄 Connecting to %s (Chain ID: %d)", chainConfig.Name, chainID))
+
+		logs := make(chan types.Log)
+		sub, err := client.SubscribeFilterLogs(m.ctx, ethereum.FilterQuery{
+			Addresses: addresses,
+		}, logs)
+
+		if err != nil {
+			m.sendMessage(fmt.Sprintf("❌ Failed to subscribe to logs on %s: %v. Retrying in %v...",
+				chainConfig.Name, err, retryDelay))
+			continue
+		}
+
+		m.sendMessage(fmt.Sprintf("🟢 Successfully connected to %s", chainConfig.Name))
+		retryDelay = initialRetryDelay // Reset delay on successful connection
+
+		for {
+			select {
+			case err := <-sub.Err():
+				m.sendMessage(fmt.Sprintf("❌ Lost connection to %s: %v. Reconnecting...",
+					chainConfig.Name, err))
+				sub.Unsubscribe()
+				break
+			case vLog := <-logs:
+				event, err := m.safeABI.EventByID(vLog.Topics[0])
+				if err != nil {
+					log.Printf("Error parsing event: %v", err)
+					continue
+				}
+
+				txURL := fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, vLog.TxHash.Hex())
+				walletLabel := addressLabels[vLog.Address]
+				msg := fmt.Sprintf("🔔 New event on %s\n"+
+					"Wallet: %s\n"+
+					"Type: %s\n"+
+					"Address: %s\n"+
+					"Transaction: %s",
+					chainConfig.Name, walletLabel, event.Name, vLog.Address.Hex(), txURL)
+				m.sendMessage(msg)
+			case <-m.ctx.Done():
+				return
+			}
 		}
 	}
 }
