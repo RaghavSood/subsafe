@@ -20,16 +20,17 @@ import (
 )
 
 type ChainConfig struct {
+	Name        string `json:"name"`
 	ChainID     int64  `json:"chain_id"`
 	RPC         string `json:"rpc_url"`
 	ExplorerURL string `json:"explorer_url"`
 }
 
 type Config struct {
-	TelegramToken string        `json:"telegram_token"`
-	ChatID        int64         `json:"chat_id"`
-	SafeAddresses []string      `json:"safe_addresses"`
-	Chains        []ChainConfig `json:"chains"`
+	TelegramToken string            `json:"telegram_token"`
+	ChatID        int64             `json:"chat_id"`
+	SafeAddresses map[string]string `json:"safe_addresses"`
+	Chains        []ChainConfig     `json:"chains"`
 }
 
 type Monitor struct {
@@ -95,7 +96,7 @@ func (m *Monitor) sendMessage(msg string) {
 	}
 }
 
-func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresses []common.Address) {
+func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresses []common.Address, addressLabels map[common.Address]string) {
 	defer m.wg.Done()
 
 	chainConfig := func() ChainConfig {
@@ -107,7 +108,7 @@ func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresse
 		return ChainConfig{}
 	}()
 
-	m.sendMessage(fmt.Sprintf("🟢 Started monitoring chain %d", chainID))
+	m.sendMessage(fmt.Sprintf("🟢 Started monitoring %s (Chain ID: %d)", chainConfig.Name, chainID))
 
 	logs := make(chan types.Log)
 	sub, err := client.SubscribeFilterLogs(m.ctx, ethereum.FilterQuery{
@@ -133,11 +134,13 @@ func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresse
 			}
 
 			txURL := fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, vLog.TxHash.Hex())
-			msg := fmt.Sprintf("🔔 New event on chain %d\n"+
+			walletLabel := addressLabels[vLog.Address]
+			msg := fmt.Sprintf("🔔 New event on %s\n"+
+				"Wallet: %s\n"+
 				"Type: %s\n"+
 				"Address: %s\n"+
 				"Transaction: %s",
-				chainID, event.Name, vLog.Address.Hex(), txURL)
+				chainConfig.Name, walletLabel, event.Name, vLog.Address.Hex(), txURL)
 			m.sendMessage(msg)
 		case <-m.ctx.Done():
 			return
@@ -146,14 +149,19 @@ func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresse
 }
 
 func (m *Monitor) Start() error {
-	addresses := make([]common.Address, len(m.config.SafeAddresses))
-	for i, addr := range m.config.SafeAddresses {
-		addresses[i] = common.HexToAddress(addr)
+	// Create slice of addresses and map of labels
+	addresses := make([]common.Address, 0, len(m.config.SafeAddresses))
+	addressLabels := make(map[common.Address]string)
+
+	for label, addr := range m.config.SafeAddresses {
+		address := common.HexToAddress(addr)
+		addresses = append(addresses, address)
+		addressLabels[address] = label
 	}
 
 	for chainID, client := range m.clients {
 		m.wg.Add(1)
-		go m.monitorChain(chainID, client, addresses)
+		go m.monitorChain(chainID, client, addresses, addressLabels)
 	}
 
 	// Setup graceful shutdown
