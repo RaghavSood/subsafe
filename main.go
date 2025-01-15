@@ -38,7 +38,6 @@ type Monitor struct {
 	config     Config
 	bot        *tgbotapi.BotAPI
 	safeABI    abi.ABI
-	clients    map[int64]*ethclient.Client
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -69,22 +68,12 @@ func NewMonitor(config Config) (*Monitor, error) {
 		return nil, fmt.Errorf("parsing ABI: %w", err)
 	}
 
-	clients := make(map[int64]*ethclient.Client)
-	for _, chain := range config.Chains {
-		client, err := ethclient.Dial(chain.RPC)
-		if err != nil {
-			return nil, fmt.Errorf("connecting to chain %d: %w", chain.ChainID, err)
-		}
-		clients[chain.ChainID] = client
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Monitor{
 		config:     config,
 		bot:        bot,
 		safeABI:    parsedABI,
-		clients:    clients,
 		ctx:        ctx,
 		cancelFunc: cancel,
 	}, nil
@@ -97,17 +86,8 @@ func (m *Monitor) sendMessage(msg string) {
 	}
 }
 
-func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresses []common.Address, addressLabels map[common.Address]string) {
+func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Address, addressLabels map[common.Address]string) {
 	defer m.wg.Done()
-
-	chainConfig := func() ChainConfig {
-		for _, c := range m.config.Chains {
-			if c.ChainID == chainID {
-				return c
-			}
-		}
-		return ChainConfig{}
-	}()
 
 	const (
 		initialRetryDelay = 1 * time.Second
@@ -132,7 +112,31 @@ func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresse
 			return // Context cancelled
 		}
 
-		m.sendMessage(fmt.Sprintf("🔄 Connecting to %s (Chain ID: %d)", chainConfig.Name, chainID))
+		m.sendMessage(fmt.Sprintf("🔄 Connecting to %s (Chain ID: %d)", chainConfig.Name, chainConfig.ChainID))
+
+		// Create new client for each attempt
+		client, err := ethclient.Dial(chainConfig.RPC)
+		if err != nil {
+			m.sendMessage(fmt.Sprintf("❌ Failed to connect to %s: %v. Retrying in %v...",
+				chainConfig.Name, err, retryDelay))
+			continue
+		}
+
+		// Verify chain ID matches expected
+		//chainID, err := client.ChainID(m.ctx)
+		//if err != nil {
+		//	m.sendMessage(fmt.Sprintf("❌ Failed to get chain ID from %s: %v. Retrying in %v...",
+		//		chainConfig.Name, err, retryDelay))
+		//	client.Close()
+		//	continue
+		//}
+
+		//if chainID.Int64() != chainConfig.ChainID {
+		//	m.sendMessage(fmt.Sprintf("❌ Chain ID mismatch on %s: expected %d, got %d. Retrying in %v...",
+		//		chainConfig.Name, chainConfig.ChainID, chainID.Int64(), retryDelay))
+		//	client.Close()
+		//	continue
+		//}
 
 		logs := make(chan types.Log)
 		sub, err := client.SubscribeFilterLogs(m.ctx, ethereum.FilterQuery{
@@ -142,39 +146,44 @@ func (m *Monitor) monitorChain(chainID int64, client *ethclient.Client, addresse
 		if err != nil {
 			m.sendMessage(fmt.Sprintf("❌ Failed to subscribe to logs on %s: %v. Retrying in %v...",
 				chainConfig.Name, err, retryDelay))
+			client.Close()
 			continue
 		}
 
 		m.sendMessage(fmt.Sprintf("🟢 Successfully connected to %s", chainConfig.Name))
 		retryDelay = initialRetryDelay // Reset delay on successful connection
 
-		for {
-			select {
-			case err := <-sub.Err():
-				m.sendMessage(fmt.Sprintf("❌ Lost connection to %s: %v. Reconnecting...",
-					chainConfig.Name, err))
-				sub.Unsubscribe()
-				break
-			case vLog := <-logs:
-				event, err := m.safeABI.EventByID(vLog.Topics[0])
-				if err != nil {
-					log.Printf("Error parsing event: %v", err)
-					continue
-				}
+		func() {
+			defer client.Close()
+			defer sub.Unsubscribe()
 
-				txURL := fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, vLog.TxHash.Hex())
-				walletLabel := addressLabels[vLog.Address]
-				msg := fmt.Sprintf("🔔 New event on %s\n"+
-					"Wallet: %s\n"+
-					"Type: %s\n"+
-					"Address: %s\n"+
-					"Transaction: %s",
-					chainConfig.Name, walletLabel, event.Name, vLog.Address.Hex(), txURL)
-				m.sendMessage(msg)
-			case <-m.ctx.Done():
-				return
+			for {
+				select {
+				case err := <-sub.Err():
+					m.sendMessage(fmt.Sprintf("❌ Lost connection to %s: %v. Reconnecting...",
+						chainConfig.Name, err))
+					return
+				case vLog := <-logs:
+					event, err := m.safeABI.EventByID(vLog.Topics[0])
+					if err != nil {
+						log.Printf("Error parsing event: %v", err)
+						continue
+					}
+
+					txURL := fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, vLog.TxHash.Hex())
+					walletLabel := addressLabels[vLog.Address]
+					msg := fmt.Sprintf("🔔 New event on %s\n"+
+						"Wallet: %s\n"+
+						"Type: %s\n"+
+						"Address: %s\n"+
+						"Transaction: %s",
+						chainConfig.Name, walletLabel, event.Name, vLog.Address.Hex(), txURL)
+					m.sendMessage(msg)
+				case <-m.ctx.Done():
+					return
+				}
 			}
-		}
+		}()
 	}
 }
 
@@ -189,9 +198,9 @@ func (m *Monitor) Start() error {
 		addressLabels[address] = label
 	}
 
-	for chainID, client := range m.clients {
+	for _, chainConfig := range m.config.Chains {
 		m.wg.Add(1)
-		go m.monitorChain(chainID, client, addresses, addressLabels)
+		go m.monitorChain(chainConfig, addresses, addressLabels)
 	}
 
 	// Setup graceful shutdown
