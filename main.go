@@ -93,10 +93,13 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 		initialRetryDelay = 1 * time.Second
 		maxRetryDelay     = 60 * time.Second
 		backoffFactor     = 2
+		maxFailedAttempts = 3
 	)
 
 	retryDelay := initialRetryDelay
 	firstConnect := true
+	attemptCount := 0
+	alertSent := false
 
 	for {
 		if !firstConnect {
@@ -106,37 +109,30 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 				retryDelay = maxRetryDelay
 			}
 		}
-		firstConnect = false
 
 		if err := m.ctx.Err(); err != nil {
 			return // Context cancelled
 		}
 
-		m.sendMessage(fmt.Sprintf("🔄 Connecting to %s (Chain ID: %d)", chainConfig.Name, chainConfig.ChainID))
+		// Only send connecting message on first attempt or after alert threshold
+		if firstConnect || (attemptCount >= maxFailedAttempts) {
+			m.sendMessage(fmt.Sprintf("🔄 Connecting to %s (Chain ID: %d)", chainConfig.Name, chainConfig.ChainID))
+		}
 
 		// Create new client for each attempt
 		client, err := ethclient.Dial(chainConfig.RPC)
 		if err != nil {
-			m.sendMessage(fmt.Sprintf("❌ Failed to connect to %s: %v. Retrying in %v...",
-				chainConfig.Name, err, retryDelay))
+			attemptCount++
+			if attemptCount >= maxFailedAttempts && !alertSent {
+				m.sendMessage(fmt.Sprintf("⚠️ ALERT: %s connection has failed %d times in a row. This could indicate a serious connectivity issue.\nLast error: %v",
+					chainConfig.Name, attemptCount, err))
+				alertSent = true
+			} else {
+				m.sendMessage(fmt.Sprintf("❌ Failed to connect to %s: %v. Retrying in %v...",
+					chainConfig.Name, err, retryDelay))
+			}
 			continue
 		}
-
-		// Verify chain ID matches expected
-		//chainID, err := client.ChainID(m.ctx)
-		//if err != nil {
-		//	m.sendMessage(fmt.Sprintf("❌ Failed to get chain ID from %s: %v. Retrying in %v...",
-		//		chainConfig.Name, err, retryDelay))
-		//	client.Close()
-		//	continue
-		//}
-
-		//if chainID.Int64() != chainConfig.ChainID {
-		//	m.sendMessage(fmt.Sprintf("❌ Chain ID mismatch on %s: expected %d, got %d. Retrying in %v...",
-		//		chainConfig.Name, chainConfig.ChainID, chainID.Int64(), retryDelay))
-		//	client.Close()
-		//	continue
-		//}
 
 		logs := make(chan types.Log)
 		sub, err := client.SubscribeFilterLogs(m.ctx, ethereum.FilterQuery{
@@ -144,14 +140,27 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 		}, logs)
 
 		if err != nil {
-			m.sendMessage(fmt.Sprintf("❌ Failed to subscribe to logs on %s: %v. Retrying in %v...",
-				chainConfig.Name, err, retryDelay))
+			attemptCount++
+			if attemptCount >= maxFailedAttempts && !alertSent {
+				m.sendMessage(fmt.Sprintf("⚠️ ALERT: %s connection has failed %d times in a row. This could indicate a serious connectivity issue.\nLast error: %v",
+					chainConfig.Name, attemptCount, err))
+				alertSent = true
+			} else {
+				m.sendMessage(fmt.Sprintf("❌ Failed to subscribe to logs on %s: %v. Retrying in %v...",
+					chainConfig.Name, err, retryDelay))
+			}
 			client.Close()
 			continue
 		}
 
-		m.sendMessage(fmt.Sprintf("🟢 Successfully connected to %s", chainConfig.Name))
-		retryDelay = initialRetryDelay // Reset delay on successful connection
+		// Successfully connected - reset counters
+		if firstConnect || alertSent {
+			m.sendMessage(fmt.Sprintf("🟢 Successfully connected to %s", chainConfig.Name))
+		}
+		retryDelay = initialRetryDelay
+		attemptCount = 0
+		alertSent = false
+		firstConnect = false
 
 		func() {
 			defer client.Close()
@@ -160,8 +169,7 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 			for {
 				select {
 				case err := <-sub.Err():
-					m.sendMessage(fmt.Sprintf("❌ Lost connection to %s: %v. Reconnecting...",
-						chainConfig.Name, err))
+					log.Printf("Error from subscription: %v", err)
 					return
 				case vLog := <-logs:
 					event, err := m.safeABI.EventByID(vLog.Topics[0])
