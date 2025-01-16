@@ -81,6 +81,8 @@ func NewMonitor(config Config) (*Monitor, error) {
 
 func (m *Monitor) sendMessage(msg string) {
 	teleMsg := tgbotapi.NewMessage(m.config.ChatID, msg)
+	teleMsg.ParseMode = "MarkdownV2"
+	teleMsg.DisableWebPagePreview = true
 	if _, err := m.bot.Send(teleMsg); err != nil {
 		log.Printf("Error sending telegram message: %v", err)
 	}
@@ -116,7 +118,8 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 
 		// Only send connecting message on first attempt or after alert threshold
 		if firstConnect || (attemptCount >= maxFailedAttempts) {
-			m.sendMessage(fmt.Sprintf("🔄 Connecting to %s (Chain ID: %d)", chainConfig.Name, chainConfig.ChainID))
+			chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
+			m.sendMessage(fmt.Sprintf("🔄 Connecting to *%s* \\(Chain ID: %d\\)", chainName, chainConfig.ChainID))
 		}
 
 		// Create new client for each attempt
@@ -124,8 +127,10 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 		if err != nil {
 			attemptCount++
 			if attemptCount >= maxFailedAttempts && !alertSent {
-				m.sendMessage(fmt.Sprintf("⚠️ ALERT: %s connection has failed %d times in a row. This could indicate a serious connectivity issue.\nLast error: %v",
-					chainConfig.Name, attemptCount, err))
+				errorMsg := strings.ReplaceAll(err.Error(), ".", "\\.")
+				chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
+				m.sendMessage(fmt.Sprintf("⚠️ *ALERT*: %s connection has failed %d times in a row\\. This could indicate a serious connectivity issue\\.\nLast error: %s",
+					chainName, attemptCount, errorMsg))
 				alertSent = true
 			} else {
 				m.sendMessage(fmt.Sprintf("❌ Failed to connect to %s: %v. Retrying in %v...",
@@ -155,7 +160,8 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 
 		// Successfully connected - reset counters
 		if firstConnect || alertSent {
-			m.sendMessage(fmt.Sprintf("🟢 Successfully connected to %s", chainConfig.Name))
+			chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
+			m.sendMessage(fmt.Sprintf("🟢 Successfully connected to *%s*", chainName))
 		}
 		retryDelay = initialRetryDelay
 		attemptCount = 0
@@ -178,14 +184,22 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 						continue
 					}
 
-					txURL := fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, vLog.TxHash.Hex())
+					txHash := vLog.TxHash.Hex()
 					walletLabel := addressLabels[vLog.Address]
-					msg := fmt.Sprintf("🔔 New event on %s\n"+
-						"Wallet: %s\n"+
-						"Type: %s\n"+
-						"Address: %s\n"+
-						"Transaction: %s",
-						chainConfig.Name, walletLabel, event.Name, vLog.Address.Hex(), txURL)
+					// Escape special characters for MarkdownV2
+					chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
+					eventName := strings.ReplaceAll(event.Name, ".", "\\.")
+					escapedLabel := strings.ReplaceAll(walletLabel, ".", "\\.")
+					address := strings.ReplaceAll(vLog.Address.Hex(), ".", "\\.")
+					txHashEscaped := strings.ReplaceAll(txHash, ".", "\\.")
+					explorerURL := strings.ReplaceAll(fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, txHash), ".", "\\.")
+
+					msg := fmt.Sprintf("🔔 *New event on %s*\n"+
+						"*Wallet:* %s\n"+
+						"*Type:* %s\n"+
+						"*Address:* `%s`\n"+
+						"*Tx:* [%s](%s)",
+						chainName, escapedLabel, eventName, address, txHashEscaped, explorerURL)
 					m.sendMessage(msg)
 				case <-m.ctx.Done():
 					return
