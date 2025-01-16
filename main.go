@@ -31,8 +31,13 @@ type ChainConfig struct {
 }
 
 type SafeTransactionResponse struct {
-	Proposer      string `json:"proposer"`
-	Confirmations []struct {
+	Safe            string `json:"safe"`
+	To              string `json:"to"`
+	Proposer        string `json:"proposer"`
+	TransactionHash string `json:"transactionHash"`
+	IsExecuted      bool   `json:"isExecuted"`
+	IsSuccessful    bool   `json:"isSuccessful"`
+	Confirmations   []struct {
 		Owner          string    `json:"owner"`
 		SubmissionDate time.Time `json:"submissionDate"`
 		SignatureType  string    `json:"signatureType"`
@@ -43,6 +48,7 @@ type Config struct {
 	TelegramToken string            `json:"telegram_token"`
 	ChatID        int64             `json:"chat_id"`
 	SafeAddresses map[string]string `json:"safe_addresses"`
+	SignerLabels  map[string]string `json:"signer_labels"`
 	Chains        []ChainConfig     `json:"chains"`
 }
 
@@ -66,6 +72,13 @@ func loadConfig(path string) (Config, error) {
 		return config, fmt.Errorf("parsing config: %w", err)
 	}
 
+	// Convert all signer addresses to lowercase for case-insensitive matching
+	normalizedLabels := make(map[string]string)
+	for addr, label := range config.SignerLabels {
+		normalizedLabels[strings.ToLower(addr)] = label
+	}
+	config.SignerLabels = normalizedLabels
+
 	return config, nil
 }
 
@@ -74,25 +87,21 @@ func getSafeTransactionDetails(serviceURL, txHash string) (*SafeTransactionRespo
 		Timeout: 5 * time.Second,
 	}
 
-	// Build the API URL
 	url := fmt.Sprintf("%s/api/v1/multisig-transactions/%s/", serviceURL, txHash)
 
-	// Make the request
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call Safe API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Check response status
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("Safe API returned non-200 status: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse the response
 	var result SafeTransactionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to decode Safe API response: %w", err)
 	}
 
@@ -119,6 +128,14 @@ func NewMonitor(config Config) (*Monitor, error) {
 		ctx:        ctx,
 		cancelFunc: cancel,
 	}, nil
+}
+
+func (m *Monitor) getSignerLabel(address string) string {
+	if label, ok := m.config.SignerLabels[strings.ToLower(address)]; ok {
+		return label
+	}
+	// If no label found, return shortened address
+	return address[:6]
 }
 
 func (m *Monitor) sendMessage(msg string) {
@@ -158,13 +175,11 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 			return // Context cancelled
 		}
 
-		// Only send connecting message on first attempt or after alert threshold
 		if firstConnect || (attemptCount >= maxFailedAttempts) {
 			chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
 			m.sendMessage(fmt.Sprintf("🔄 Connecting to *%s* \\(Chain ID: %d\\)", chainName, chainConfig.ChainID))
 		}
 
-		// Create new client for each attempt
 		client, err := ethclient.Dial(chainConfig.RPC)
 		if err != nil {
 			attemptCount++
@@ -200,7 +215,6 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 			continue
 		}
 
-		// Successfully connected - reset counters
 		if firstConnect || alertSent {
 			chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
 			m.sendMessage(fmt.Sprintf("🟢 Successfully connected to *%s*", chainName))
@@ -228,6 +242,7 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 
 					txHash := vLog.TxHash.Hex()
 					walletLabel := addressLabels[vLog.Address]
+
 					// Escape special characters for MarkdownV2
 					chainName := strings.ReplaceAll(chainConfig.Name, ".", "\\.")
 					eventName := strings.ReplaceAll(event.Name, ".", "\\.")
@@ -239,20 +254,25 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 					var signerInfo string
 					if eventName == "ExecutionSuccess" && len(vLog.Topics) > 1 {
 						safeTxHash := vLog.Topics[1].Hex()
-						// Try to get Safe transaction details
 						if chainConfig.SafeServiceURL != "" {
 							if txDetails, err := getSafeTransactionDetails(chainConfig.SafeServiceURL, safeTxHash); err != nil {
 								signerInfo = "\n\\(Safe API call failed\\)"
 							} else {
-								proposer := strings.ReplaceAll(txDetails.Proposer[:6], ".", "\\.")
+								// Get proposer label or shortened address
+								proposerLabel := m.getSignerLabel(txDetails.Proposer)
+								proposerLabel = strings.ReplaceAll(proposerLabel, ".", "\\.")
+								propURL := strings.ReplaceAll(fmt.Sprintf("%s/address/%s", chainConfig.ExplorerURL, txDetails.Proposer), ".", "\\.")
+								proposerLabel = fmt.Sprintf("[%s](%s)", proposerLabel, propURL)
+
 								signers := make([]string, 0, len(txDetails.Confirmations))
 								for _, conf := range txDetails.Confirmations {
-									signer := strings.ReplaceAll(conf.Owner[:6], ".", "\\.")
-									sigType := strings.ReplaceAll(string(conf.SignatureType), ".", "\\.")
-									signers = append(signers, fmt.Sprintf("`%s` \\(%s\\)", signer, sigType))
+									signerLabel := m.getSignerLabel(conf.Owner)
+									signerLabel = strings.ReplaceAll(signerLabel, ".", "\\.")
+									signerURL := strings.ReplaceAll(fmt.Sprintf("%s/address/%s", chainConfig.ExplorerURL, conf.Owner), ".", "\\.")
+									signers = append(signers, fmt.Sprintf("[%s](%s)", signerLabel, signerURL))
 								}
-								signerInfo = fmt.Sprintf("\n*Proposer:* `%s`\n*Signers:* %s",
-									proposer, strings.Join(signers, ", "))
+								signerInfo = fmt.Sprintf("\n*Proposer:* %s\n*Signers:* %s",
+									proposerLabel, strings.Join(signers, ", "))
 							}
 						}
 					}
@@ -273,7 +293,6 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 }
 
 func (m *Monitor) Start() error {
-	// Create slice of addresses and map of labels
 	addresses := make([]common.Address, 0, len(m.config.SafeAddresses))
 	addressLabels := make(map[common.Address]string)
 
@@ -288,7 +307,6 @@ func (m *Monitor) Start() error {
 		go m.monitorChain(chainConfig, addresses, addressLabels)
 	}
 
-	// Setup graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
