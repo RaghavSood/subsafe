@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,10 +23,20 @@ import (
 )
 
 type ChainConfig struct {
-	Name        string `json:"name"`
-	ChainID     int64  `json:"chain_id"`
-	RPC         string `json:"rpc_url"`
-	ExplorerURL string `json:"explorer_url"`
+	Name           string `json:"name"`
+	ChainID        int64  `json:"chain_id"`
+	RPC            string `json:"rpc_url"`
+	ExplorerURL    string `json:"explorer_url"`
+	SafeServiceURL string `json:"safe_service_url"`
+}
+
+type SafeTransactionResponse struct {
+	Proposer      string `json:"proposer"`
+	Confirmations []struct {
+		Owner          string    `json:"owner"`
+		SubmissionDate time.Time `json:"submissionDate"`
+		SignatureType  string    `json:"signatureType"`
+	} `json:"confirmations"`
 }
 
 type Config struct {
@@ -55,6 +67,36 @@ func loadConfig(path string) (Config, error) {
 	}
 
 	return config, nil
+}
+
+func getSafeTransactionDetails(serviceURL, txHash string) (*SafeTransactionResponse, error) {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	// Build the API URL
+	url := fmt.Sprintf("%s/api/v1/multisig-transactions/%s/", serviceURL, txHash)
+
+	// Make the request
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call Safe API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Safe API returned non-200 status: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the response
+	var result SafeTransactionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode Safe API response: %w", err)
+	}
+
+	return &result, nil
 }
 
 func NewMonitor(config Config) (*Monitor, error) {
@@ -194,12 +236,33 @@ func (m *Monitor) monitorChain(chainConfig ChainConfig, addresses []common.Addre
 					txHashEscaped := strings.ReplaceAll(txHash, ".", "\\.")
 					explorerURL := strings.ReplaceAll(fmt.Sprintf("%s/tx/%s", chainConfig.ExplorerURL, txHash), ".", "\\.")
 
+					var signerInfo string
+					if eventName == "ExecutionSuccess" && len(vLog.Topics) > 1 {
+						safeTxHash := vLog.Topics[1].Hex()
+						// Try to get Safe transaction details
+						if chainConfig.SafeServiceURL != "" {
+							if txDetails, err := getSafeTransactionDetails(chainConfig.SafeServiceURL, safeTxHash); err != nil {
+								signerInfo = "\n\\(Safe API call failed\\)"
+							} else {
+								proposer := strings.ReplaceAll(txDetails.Proposer[:6], ".", "\\.")
+								signers := make([]string, 0, len(txDetails.Confirmations))
+								for _, conf := range txDetails.Confirmations {
+									signer := strings.ReplaceAll(conf.Owner[:6], ".", "\\.")
+									sigType := strings.ReplaceAll(string(conf.SignatureType), ".", "\\.")
+									signers = append(signers, fmt.Sprintf("`%s` \\(%s\\)", signer, sigType))
+								}
+								signerInfo = fmt.Sprintf("\n*Proposer:* `%s`\n*Signers:* %s",
+									proposer, strings.Join(signers, ", "))
+							}
+						}
+					}
+
 					msg := fmt.Sprintf("🔔 *New event on %s*\n"+
 						"*Wallet:* %s\n"+
 						"*Type:* %s\n"+
 						"*Address:* `%s`\n"+
-						"*Tx:* [%s](%s)",
-						chainName, escapedLabel, eventName, address, txHashEscaped, explorerURL)
+						"*Tx:* [%s](%s)%s",
+						chainName, escapedLabel, eventName, address, txHashEscaped, explorerURL, signerInfo)
 					m.sendMessage(msg)
 				case <-m.ctx.Done():
 					return
